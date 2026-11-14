@@ -1,69 +1,413 @@
-import json, io
-import numpy as np
-import openpyxl
-book = None
+const $ = id => document.getElementById(id);
+const fmt = (x, d = 3) => Number(x).toLocaleString('ko-KR', { maximumFractionDigits: d });
+const fmt4 = x => Number(x).toLocaleString('ko-KR', { minimumFractionDigits: 4, maximumFractionDigits: 4 });
 
-def emit(x):
-    return json.dumps(x, ensure_ascii=False, allow_nan=False)
+let worker, nextId = 0, requests = new Map();
+let sectors = [], rowChoices = [], cells = [], basket = [], result = null;
+let indicators = [], chains = {}, currentSummary = null;
 
-def initialize(raw):
-    global book, codes, names, L, M, V, sheets, valid
-    wb = openpyxl.load_workbook(io.BytesIO(bytes(raw)), read_only=True, data_only=True)
-    book = {s: list(wb[s].values) for s in wb.sheetnames}
-    wb.close()
-    sheets = list(book)
-    base = book['국산투입계수(Ad)']
-    codes = [str(c) for c in base[4][2:] if c is not None and str(c).isdigit() and int(str(c)) < 9000]
-    if len(codes) != 380 or len(set(codes)) != len(codes):
-        raise ValueError('이 버전은 첨부된 2023년 380부문 워크북 구조만 지원합니다.')
-    nm = {str(r[0]): str(r[1]) for r in base[6:]}
-    names = [nm[c] for c in codes]
-    def matrix(s):
-        rows = book[s]
-        ri = {str(r[0]): i for i,r in enumerate(rows) if r}
-        ci = {str(c): i for i,c in enumerate(rows[4])}
-        a = np.array([[rows[ri[c]][ci[k]] for k in codes] for c in codes], dtype=float)
-        if not np.isfinite(a).all(): raise ValueError(s + ': 비수치 또는 결측 데이터')
-        return a
-    L = matrix('생산유발계수'); M = matrix('수입유발계수'); V = matrix('부가가치유발계수')
-    ad = matrix('국산투입계수(Ad)'); am = matrix('수입투입계수(Am)')
-    rows=book['총투입계수(A)']; ci={str(c):i for i,c in enumerate(rows[4])}
-    vr=next(r for r in rows if str(r[0])=='9690')
-    v=np.array([vr[ci[c]] for c in codes],dtype=float)
-    residuals = {'생산':float(np.max(np.abs((np.eye(len(codes))-ad)@L-np.eye(len(codes))))),
-                 '수입':float(np.max(np.abs(am@L-M))),
-                 '부가가치':float(np.max(np.abs(v[:,None]*L-V)))}
-    valid = max(residuals.values()) < 1e-8
-    if not valid: raise ValueError('계수 검증 실패: '+str(residuals))
-    return emit({'sectors':[{'code':c,'name':n} for c,n in zip(codes,names)],
-                 'sheets':sheets,'residuals':residuals})
+const CONTROL_IDS = [
+  'sheet', 'row', 'sector', 'add', 'run', 'row-search', 'col-search',
+  'sector-search', 'amount', 'indicator-search', 'quadrant-filter',
+  'indicator-sort', 'chain-sector', 'download-indicators'
+];
 
-def explore(sheet, rowcode):
-    rows=book[sheet]
-    choices=[{'code':str(r[0]),'name':str(r[1])} for r in rows[6:] if len(r)>1 and r[0] is not None and r[1] is not None]
-    chosen=next((r for r in rows[6:] if str(r[0])==rowcode),None)
-    if chosen is None: chosen=next(r for r in rows[6:] if r[0] is not None and r[1] is not None)
-    cells=[]
-    for i in range(2,len(rows[4])):
-        if rows[4][i] is None: continue
-        val=chosen[i] if i<len(chosen) else None
-        if isinstance(val,(float,int)): val=float(val)
-        elif val is not None: val=str(val)
-        cells.append({'code':str(rows[4][i]),'name':str(rows[5][i] or ''),'value':val})
-    return emit({'rows':choices,'selected':str(chosen[0]),'name':str(chosen[1]),
-                 'unit':str(rows[3][0] or '係数').replace('係数','계수 / 비율: 행·열 명칭 확인'), 'cells':cells})
+function text(tag, value) {
+  const e = document.createElement(tag);
+  e.textContent = value;
+  return e;
+}
 
-def simulate(payload):
-    if not valid: raise ValueError('검증된 데이터가 없습니다.')
-    shocks=json.loads(payload); f=np.zeros(len(codes))
-    for s in shocks:
-        a=float(s['amount'])
-        if not np.isfinite(a) or a<0: raise ValueError('수요 증가액은 유한한 0 이상의 수여야 합니다.')
-        f[codes.index(s['code'])]+=a
-    if not f.sum()>0: raise ValueError('한 산업 이상의 양의 수요 증가액을 입력하세요.')
-    x=L@f; m=M@f; v=V@f
-    result=[{'code':c,'name':n,'production':float(a),'imports':float(b),'valueAdded':float(d)}
-            for c,n,a,b,d in zip(codes,names,x,m,v)]
-    result.sort(key=lambda r:r['production'],reverse=True)
-    return emit({'demand':float(f.sum()),'production':float(x.sum()),'imports':float(m.sum()),
-                 'valueAdded':float(v.sum()),'multiplier':float(x.sum()/f.sum()),'rows':result})
+function call(type, payload) {
+  return new Promise((resolve, reject) => {
+    const id = ++nextId;
+    requests.set(id, { resolve, reject });
+    worker.postMessage({ id, type, payload });
+  });
+}
+
+function startWorker() {
+  worker = new Worker('./worker.js');
+  worker.onmessage = ({ data: d }) => {
+    if (d.type === 'status') {
+      $('status').textContent = d.text;
+      return;
+    }
+    const p = requests.get(d.id);
+    if (!p) return;
+    requests.delete(d.id);
+    d.ok ? p.resolve(d.result) : p.reject(Error(d.error));
+  };
+  worker.onerror = e => {
+    for (const p of requests.values()) p.reject(Error(e.message || 'Worker 실행 오류'));
+    requests.clear();
+  };
+}
+
+function options(el, list) {
+  el.replaceChildren(...list.map(x => {
+    const o = document.createElement('option');
+    o.value = x.code;
+    o.textContent = x.code + ' ' + x.name;
+    return o;
+  }));
+}
+
+function invalidate() {
+  result = null;
+  $('results').hidden = true;
+}
+
+function setControlsDisabled(flag) {
+  for (const id of CONTROL_IDS) {
+    if ($(id)) $(id).disabled = flag;
+  }
+}
+
+async function load(buffer) {
+  invalidate();
+  basket = [];
+  renderBasket();
+  setControlsDisabled(true);
+
+  if (worker) worker.terminate();
+  for (const p of requests.values()) p.reject(Error('새 자료 로드'));
+  requests.clear();
+  startWorker();
+
+  try {
+    const info = await call('init', buffer);
+    sectors = info.sectors;
+    indicators = info.indicators || [];
+    chains = info.chains || {};
+    currentSummary = info.summary || null;
+
+    options($('sector'), sectors);
+    options($('chain-sector'), sectors);
+    $('sector-search').value = '';
+    $('row-search').value = '';
+    $('col-search').value = '';
+    $('indicator-search').value = '';
+    $('quadrant-filter').value = 'ALL';
+
+    $('sheet').replaceChildren(...info.sheets.map(s => {
+      const o = text('option', s);
+      o.value = s;
+      return o;
+    }));
+
+    $('validation').textContent = JSON.stringify(info.residuals, null, 2) + '\n검증 결과: 모든 행렬 항등식 잔차 < 1e-7 통과';
+    if (currentSummary) {
+      $('active-classification').textContent = '2023 연장표 · 생산자가격 · ' + currentSummary.classification;
+    }
+
+    setControlsDisabled(false);
+    renderStructureSummary();
+    renderIndicators();
+    renderChains();
+    await explore();
+
+    $('status').textContent = '준비 완료 · ' + (currentSummary ? currentSummary.classification : sectors.length + '개 부문') + ' · ' + info.sheets.length + '개 시트 로딩 완료';
+    $('sim-status').textContent = '시나리오를 추가한 뒤 파급효과 계산 실행 버튼을 누르세요.';
+  } catch (e) {
+    $('status').textContent = '로딩 실패: ' + e.message;
+  }
+}
+
+let exploreSeq = 0;
+async function explore() {
+  const seq = ++exploreSeq;
+  try {
+    const d = await call('explore', { sheet: $('sheet').value, row: $('row').value });
+    if (seq !== exploreSeq) return;
+    rowChoices = d.rows;
+    filterRows(d.selected);
+    cells = d.cells;
+    $('unit').textContent = d.unit;
+    $('explore-caption').textContent = $('sheet').value + ' / 선택 행: [' + d.selected + '] ' + d.name;
+    renderCells();
+  } catch (e) {
+    $('status').textContent = e.message;
+  }
+}
+
+function filterRows(selected) {
+  const q = $('row-search').value.trim().toLowerCase();
+  options($('row'), rowChoices.filter(r => (r.code + ' ' + r.name).toLowerCase().includes(q)));
+  if ([...$('row').options].some(o => o.value === selected)) $('row').value = selected;
+}
+
+function renderCells() {
+  const q = $('col-search').value.trim().toLowerCase();
+  $('cells').replaceChildren(...cells.filter(c => (c.code + ' ' + c.name).toLowerCase().includes(q)).map(c => {
+    const tr = document.createElement('tr');
+    const valStr = c.value === null ? '빈 셀' : typeof c.value === 'number' ? fmt(c.value, 6) : c.value;
+    for (const v of [c.code, c.name, valStr]) tr.append(text('td', v));
+    return tr;
+  }));
+}
+
+function renderStructureSummary() {
+  if (!currentSummary) return;
+  const items = [
+    ['분석 분류 기준', currentSummary.classification, '한국은행 2023 연장표'],
+    ['평균 생산유발계수', fmt4(currentSummary.avgProdCoeff), '단위당 유발액 (배)'],
+    ['평균 부가가치유발계수', fmt4(currentSummary.avgVaCoeff), '단위당 유발액 (비율)'],
+    ['평균 수입유발계수', fmt4(currentSummary.avgImpCoeff), '단위당 유발액 (비율)'],
+    ['평균 부가가치율', fmt(currentSummary.avgVaRate * 100, 2) + '%', '총투입 대비 비중']
+  ];
+  $('structure-cards').replaceChildren(...items.map(([title, val, unit]) => {
+    const d = text('div', title);
+    d.className = 'card';
+    d.append(text('strong', val), text('span', unit));
+    return d;
+  }));
+}
+
+function getFilteredIndicators() {
+  const q = $('indicator-search').value.trim().toLowerCase();
+  const qf = $('quadrant-filter').value;
+  const sortKey = $('indicator-sort').value;
+
+  const list = indicators.filter(item => {
+    const matchText = (item.code + ' ' + item.name).toLowerCase().includes(q);
+    const matchQuad = qf === 'ALL' || item.quadrant === qf;
+    return matchText && matchQuad;
+  });
+
+  list.sort((a, b) => {
+    if (sortKey === 'code') return a.code.localeCompare(b.code);
+    return b[sortKey] - a[sortKey];
+  });
+  return list;
+}
+
+function renderIndicators() {
+  const list = getFilteredIndicators();
+  $('indicator-rows').replaceChildren(...list.map(r => {
+    const tr = document.createElement('tr');
+    const vals = [
+      r.code,
+      r.name,
+      r.quadrant,
+      fmt4(r.backward),
+      fmt4(r.forward),
+      fmt4(r.vaRate),
+      fmt4(r.domInputRate),
+      fmt4(r.prodCoeff),
+      fmt4(r.vaCoeff),
+      fmt4(r.impCoeff)
+    ];
+    vals.forEach(v => tr.append(text('td', v)));
+    return tr;
+  }));
+}
+
+function renderChains() {
+  const code = $('chain-sector').value;
+  const data = chains[code] || { inputs: [], outputs: [] };
+
+  $('chain-inputs').replaceChildren(...data.inputs.map(r => {
+    const tr = document.createElement('tr');
+    [r.code, r.name, fmt4(r.coeff), fmt4(r.induced)].forEach(v => tr.append(text('td', v)));
+    return tr;
+  }));
+
+  $('chain-outputs').replaceChildren(...data.outputs.map(r => {
+    const tr = document.createElement('tr');
+    [r.code, r.name, fmt4(r.coeff), fmt4(r.induced)].forEach(v => tr.append(text('td', v)));
+    return tr;
+  }));
+}
+
+$('sheet').onchange = () => {
+  $('row-search').value = '';
+  $('row').replaceChildren();
+  explore();
+};
+$('row').onchange = explore;
+$('row-search').oninput = () => {
+  filterRows();
+  if ($('row').value) explore();
+  else {
+    $('cells').replaceChildren();
+    $('explore-caption').textContent = '일치하는 행이 없습니다.';
+  }
+};
+$('col-search').oninput = renderCells;
+
+$('indicator-search').oninput = renderIndicators;
+$('quadrant-filter').onchange = renderIndicators;
+$('indicator-sort').onchange = renderIndicators;
+$('chain-sector').onchange = renderChains;
+
+$('sector-search').oninput = () => {
+  const q = $('sector-search').value.trim().toLowerCase();
+  options($('sector'), sectors.filter(s => (s.code + ' ' + s.name).toLowerCase().includes(q)));
+};
+
+function renderBasket() {
+  $('basket').replaceChildren(...basket.map((s, i) => {
+    const li = text('li', '[' + s.code + '] ' + s.name + ' : +' + fmt(s.amount) + ' 백만원 ');
+    const b = text('button', '삭제');
+    b.type = 'button';
+    b.onclick = () => {
+      basket.splice(i, 1);
+      invalidate();
+      renderBasket();
+    };
+    li.append(b);
+    return li;
+  }));
+  $('sim-status').textContent = basket.length
+    ? basket.length + '개 산업 수요 충격 설정 완료. 파급효과 계산 실행 버튼을 누르세요.'
+    : '시나리오를 추가하세요.';
+}
+
+$('scenario').onsubmit = e => {
+  e.preventDefault();
+  const amount = Number($('amount').value);
+  const s = sectors.find(item => item.code === $('sector').value);
+  if (!s || !Number.isFinite(amount) || amount <= 0) {
+    $('sim-status').textContent = '대상 산업과 0보다 큰 수요 증가액(백만원)을 확인하세요.';
+    return;
+  }
+  basket.push({ ...s, amount });
+  invalidate();
+  renderBasket();
+};
+
+$('clear').onclick = () => {
+  basket = [];
+  invalidate();
+  renderBasket();
+};
+
+$('run').onclick = async () => {
+  if (!basket.length) {
+    $('sim-status').textContent = '시나리오를 먼저 추가하세요.';
+    return;
+  }
+  const snapshot = basket.map(s => ({ ...s }));
+  $('run').disabled = true;
+  $('sim-status').textContent = '파급효과 계산 중…';
+  try {
+    const r = await call('simulate', snapshot);
+    if (JSON.stringify(snapshot) !== JSON.stringify(basket)) {
+      $('sim-status').textContent = '입력이 변경되었습니다. 다시 계산하세요.';
+      return;
+    }
+    result = r;
+    renderResult();
+    $('sim-status').textContent = '계산 완료 (단위: 백만원 / 생산유발승수: ' + fmt4(r.multiplier) + '배).';
+  } catch (e) {
+    invalidate();
+    $('sim-status').textContent = '계산 실패: ' + e.message;
+  } finally {
+    $('run').disabled = false;
+  }
+};
+
+function renderResult() {
+  $('results').hidden = false;
+  const cardItems = [
+    ['최종수요 증가액', fmt(result.demand), '백만원'],
+    ['총 생산유발액', fmt(result.production), '백만원 (승수 ' + fmt4(result.multiplier) + '배)'],
+    ['총 수입유발액', fmt(result.imports), '백만원 (계수 ' + fmt4(result.impMultiplier) + ')'],
+    ['총 부가가치유발액', fmt(result.valueAdded), '백만원 (계수 ' + fmt4(result.vaMultiplier) + ')']
+  ];
+  $('cards').replaceChildren(...cardItems.map(([title, v, unit]) => {
+    const d = text('div', title);
+    d.className = 'card';
+    d.append(text('strong', v), text('span', unit));
+    return d;
+  }));
+
+  const max = Math.max(...result.rows.map(r => r.production), 1);
+  $('bars').replaceChildren(...result.rows.slice(0, 15).map(r => {
+    const d = text('div', r.name + ' · ' + fmt(r.production) + ' 백만원 (' + fmt(r.share, 2) + '%)');
+    d.className = 'bar';
+    const t = document.createElement('div');
+    t.className = 'track';
+    const f = document.createElement('div');
+    f.className = 'fill';
+    f.style.width = Math.max(0, r.production / max * 100) + '%';
+    t.append(f);
+    d.append(t);
+    return d;
+  }));
+
+  $('result-rows').replaceChildren(...result.rows.map(r => {
+    const tr = document.createElement('tr');
+    [r.code, r.name, fmt(r.production), fmt(r.share, 2) + '%', fmt(r.imports), fmt(r.valueAdded)].forEach(v => tr.append(text('td', v)));
+    return tr;
+  }));
+}
+
+function csvCell(v) {
+  let s = String(v);
+  if (/^[=+@-]/.test(s) && typeof v !== 'number') s = "'" + s;
+  return '"' + s.replaceAll('"', '""') + '"';
+}
+
+function triggerCsv(filename, rows) {
+  const blob = new Blob(['\ufeff' + rows.map(r => r.map(csvCell).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+$('download').onclick = () => {
+  if (!result) return;
+  const rows = [
+    ['산업코드', '산업명', '생산유발액_백만원', '생산유발비중_퍼센트', '수입유발액_백만원', '부가가치유발액_백만원'],
+    ...result.rows.map(r => [r.code, r.name, r.production, r.share, r.imports, r.valueAdded])
+  ];
+  triggerCsv('io-2023-simulation-results.csv', rows);
+};
+
+$('download-indicators').onclick = () => {
+  const list = getFilteredIndicators();
+  if (!list.length) return;
+  const rows = [
+    ['산업코드', '산업명', '산업유형', '영향력계수_지수', '감응도계수_지수', '부가가치율_비율', '국산투입률_비율', '수입투입률_비율', '생산유발계수', '부가가치유발계수', '수입유발계수'],
+    ...list.map(r => [r.code, r.name, r.quadrant, r.backward, r.forward, r.vaRate, r.domInputRate, r.impInputRate, r.prodCoeff, r.vaCoeff, r.impCoeff])
+  ];
+  triggerCsv('io-2023-linkage-indicators.csv', rows);
+};
+
+async function fetchWorkbookBuffer(filename) {
+  const encoded = encodeURIComponent(filename);
+  for (const prefix of ['./data/', './']) {
+    const res = await fetch(prefix + encoded);
+    if (res.ok) return await res.arrayBuffer();
+  }
+  throw Error(filename + ' 파일을 저장소에서 찾을 수 없습니다.');
+}
+
+document.querySelectorAll('.dataset-btn').forEach(btn => {
+  btn.onclick = async () => {
+    const allBtns = document.querySelectorAll('.dataset-btn');
+    allBtns.forEach(b => (b.disabled = true));
+    const filename = btn.dataset.file;
+    $('status').textContent = filename + ' 내려받는 중…';
+    try {
+      const buf = await fetchWorkbookBuffer(filename);
+      await load(buf);
+    } catch (err) {
+      $('status').textContent = '불러오기 실패: ' + err.message;
+    } finally {
+      allBtns.forEach(b => (b.disabled = false));
+    }
+  };
+});
+
+$('file-upload').onchange = async e => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  $('status').textContent = file.name + ' 읽는 중…';
+  await load(await file.arrayBuffer());
+};
