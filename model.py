@@ -41,7 +41,7 @@ def code_key(s):
 
 def is_sector_code(val):
     s = norm_code(val)
-    if not s:
+    if not s or s == '0' or '.' in s or s.startswith('-'):
         return False
     skip_words = ('코드', '부문', '상품', 'Code', '합계', '계', '단위', '표')
     if any(w in s for w in skip_words):
@@ -93,7 +93,7 @@ def find_sheet(kind):
 def detect_layout(rows):
     best_idx = 4
     best_count = -1
-    limit = min(15, len(rows))
+    limit = min(9, len(rows))
     for idx in range(limit):
         r = rows[idx]
         if not r or len(r) < 4:
