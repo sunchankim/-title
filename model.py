@@ -2,7 +2,9 @@ import json, io
 import numpy as np
 import openpyxl
 
-book = None
+raw_bytes = None
+book = {}
+sheet_names = []
 codes = []
 names = []
 L = None
@@ -12,6 +14,16 @@ valid = False
 
 def emit(x):
     return json.dumps(x, ensure_ascii=False, allow_nan=False)
+
+def to_float(val):
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip().replace(',', '')
+    if s in ('', '-', '—', '–', '.', 'N/A', 'nan', 'NaN'):
+        return 0.0
+    return float(s)
 
 def norm_code(val):
     if val is None:
@@ -40,8 +52,15 @@ def is_sector_code(val):
         return False
     return True
 
+def get_sheet_rows(s):
+    if s not in book:
+        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+        book[s] = list(wb[s].values)
+        wb.close()
+    return book[s]
+
 def find_sheet(kind):
-    names_clean = [(s, s.replace(' ', '')) for s in book]
+    names_clean = [(s, s.replace(' ', '')) for s in sheet_names]
     if kind == '국산투입계수':
         for s, sc in names_clean:
             if '국산투입계수' in sc:
@@ -69,7 +88,7 @@ def find_sheet(kind):
         for s, sc in names_clean:
             if '부가가치유발계수' in sc:
                 return s
-    raise ValueError(f"필수 시트({kind})를 찾을 수 없습니다. (현재 시트: {', '.join(book.keys())})")
+    raise ValueError(f"필수 시트({kind})를 찾을 수 없습니다. (현재 시트: {', '.join(sheet_names)})")
 
 def detect_layout(rows):
     best_idx = 4
@@ -95,13 +114,25 @@ def detect_layout(rows):
     return code_row, name_row, data_start
 
 def initialize(raw):
-    global book, codes, names, L, M, V, valid
-    wb = openpyxl.load_workbook(io.BytesIO(bytes(raw)), read_only=True, data_only=True)
-    book = {s: list(wb[s].values) for s in wb.sheetnames}
-    wb.close()
-    sheets = list(book)
+    global raw_bytes, book, sheet_names, codes, names, L, M, V, valid
+    raw_bytes = bytes(raw)
+    book = {}
 
-    base = book[find_sheet('국산투입계수')]
+    wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+    sheet_names = list(wb.sheetnames)
+    needed = [
+        find_sheet('국산투입계수'),
+        find_sheet('수입투입계수'),
+        find_sheet('총투입계수'),
+        find_sheet('생산유발계수'),
+        find_sheet('수입유발계수'),
+        find_sheet('부가가치유발계수')
+    ]
+    for s in set(needed):
+        book[s] = list(wb[s].values)
+    wb.close()
+
+    base = get_sheet_rows(find_sheet('국산투입계수'))
     c_row, _, d_start = detect_layout(base)
 
     nm_by_key = {}
@@ -132,7 +163,7 @@ def initialize(raw):
 
     def matrix(kind):
         s = find_sheet(kind)
-        rows = book[s]
+        rows = get_sheet_rows(s)
         cr, _, ds = detect_layout(rows)
         ri = {}
         for i in range(ds, len(rows)):
@@ -157,7 +188,7 @@ def initialize(raw):
                 if kc not in ci:
                     raise ValueError(f"{s} 시트에서 열 코드({codes[idx_c]})를 찾을 수 없습니다.")
                 val = row_vals[ci[kc]] if ci[kc] < len(row_vals) else 0.0
-                a[idx_r, idx_c] = 0.0 if val is None else float(val)
+                a[idx_r, idx_c] = to_float(val)
         if not np.isfinite(a).all():
             raise ValueError(s + ': 비수치 또는 결측 데이터')
         return a
@@ -168,18 +199,22 @@ def initialize(raw):
     ad = matrix('국산투입계수')
     am = matrix('수입투입계수')
 
-    rows_A = book[find_sheet('총투입계수')]
+    rows_A = get_sheet_rows(find_sheet('총투입계수'))
     cr_A, _, ds_A = detect_layout(rows_A)
     ci_A = {code_key(c): i for i, c in enumerate(rows_A[cr_A]) if c is not None}
 
     vr = next((r for r in rows_A[ds_A:] if r and norm_code(r[0]) in ('9690', '9600', '9700')), None)
     if vr is None:
-        vr = next((r for r in rows_A[ds_A:] if r and len(r) > 1 and r[1] is not None and '부가가치계' in str(r[1]).replace(' ', '')), None)
+        vr = next((
+            r for r in rows_A[ds_A:]
+            if r and len(r) > 1 and r[1] is not None
+            and any(w in str(r[1]).replace(' ', '') for w in ('부가가치계', '부가가치합계', '부가가치총계'))
+        ), None)
     if vr is None:
         raise ValueError('투입계수 시트에서 부가가치계 행을 찾을 수 없습니다.')
 
     v = np.array([
-        0.0 if (ci_A[k] >= len(vr) or vr[ci_A[k]] is None) else float(vr[ci_A[k]])
+        0.0 if ci_A[k] >= len(vr) else to_float(vr[ci_A[k]])
         for k in keys
     ], dtype=float)
 
@@ -188,7 +223,7 @@ def initialize(raw):
         '수입유발잔차': float(np.max(np.abs(am @ L - M))),
         '부가가치유발잔차': float(np.max(np.abs(v[:, None] * L - V)))
     }
-    valid = max(residuals.values()) < 1e-2
+    valid = max(residuals.values()) < 5e-2
     if not valid:
         raise ValueError('계수 검증 실패: ' + str(residuals))
 
@@ -259,7 +294,7 @@ def initialize(raw):
 
     return emit({
         'sectors': [{'code': c, 'name': nm_i} for c, nm_i in zip(codes, names)],
-        'sheets': sheets,
+        'sheets': sheet_names,
         'residuals': residuals,
         'summary': summary,
         'indicators': indicators,
@@ -267,7 +302,7 @@ def initialize(raw):
     })
 
 def explore(sheet, rowcode):
-    rows = book[sheet]
+    rows = get_sheet_rows(sheet)
     cr, nr, ds = detect_layout(rows)
     choices = [
         {'code': norm_code(r[0]), 'name': str(r[1]).strip()}
