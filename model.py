@@ -2,7 +2,6 @@ import json, io
 import numpy as np
 import openpyxl
 
-raw_bytes = None
 book = {}
 sheet_names = []
 codes = []
@@ -54,7 +53,10 @@ def is_sector_code(val):
 
 def get_sheet_rows(s):
     if s not in book:
-        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+        raw_data = book.get('_raw')
+        if raw_data is None:
+            raise ValueError('먼저 상단의 분류 버튼을 눌러 엑셀 자료를 불러오세요.')
+        wb = openpyxl.load_workbook(io.BytesIO(raw_data), read_only=True, data_only=True)
         book[s] = list(wb[s].values)
         wb.close()
     return book[s]
@@ -114,11 +116,12 @@ def detect_layout(rows):
     return code_row, name_row, data_start
 
 def initialize(raw):
-    global raw_bytes, book, sheet_names, codes, names, L, M, V, valid
-    raw_bytes = bytes(raw)
-    book = {}
+    global sheet_names, codes, names, L, M, V, valid
+    raw_data = bytes(raw)
+    book.clear()
+    book['_raw'] = raw_data
 
-    wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+    wb = openpyxl.load_workbook(io.BytesIO(raw_data), read_only=True, data_only=True)
     sheet_names = list(wb.sheetnames)
     needed = [
         find_sheet('국산투입계수'),
